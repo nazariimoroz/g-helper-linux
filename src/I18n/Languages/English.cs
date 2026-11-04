@@ -544,7 +544,7 @@ public static class English
         ["gpu_backend_header"] = "GPU Backend",
         ["gpu_backend_intro"] = "Choose how ghelper switches the dGPU on and off. ASUS WMI (firmware) is the default; the alternatives below help when the firmware path is missing or unreliable on your hardware.",
         ["gpu_backend_pci_label"] = "Use PCI dGPU disable",
-        ["gpu_backend_pci_hint"] = "Disables the dGPU via a modprobe blacklist plus a udev hot-remove rule. Required on non-ASUS laptops where there is no ASUS firmware to talk to, optional on ASUS where you prefer the kernel-only path. Every mode change requires a reboot because the rules only apply on the next boot.",
+        ["gpu_backend_pci_hint"] = "Disables the dGPU via a modprobe blacklist plus a udev hot-remove rule. Required on non-ASUS laptops where there is no ASUS firmware to talk to, optional on ASUS where you prefer the kernel-only path. Live switching is attempted when possible; a reboot may still be required if driver release or GPU recovery fails.",
         ["auto_switch_refresh"] = "Auto-switch refresh rate (AC/Battery)",
         ["cpu_cores"] = "CPU Cores",
         ["cpu_cores_format"] = "{0}/{1}",

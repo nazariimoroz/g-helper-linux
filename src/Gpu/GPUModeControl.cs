@@ -1171,14 +1171,14 @@ public class GPUModeControl
     /// <summary>
     /// PCI backend switching. There are only two effective modes - Eco
     /// (block artifacts present) and Standard (no block artifacts). The
-    /// transition is always deferred to reboot; the boot script does the
-    /// actual rmmod / PCI rescan work. Optimized and Ultimate fall through
-    /// to Standard since they have no meaning without ASUS firmware.
+    /// controller attempts live driver release / PCI recovery and falls back
+    /// to reboot when that fails. Optimized and Ultimate fall through to
+    /// Standard since they have no meaning without ASUS firmware.
     /// </summary>
     private GpuSwitchResult ComputeAndExecutePci(GpuMode target)
     {
         // Optimized / Ultimate are not meaningful in PCI mode. Treat them as
-        // Standard so the dGPU is enabled at next boot. The UI should be
+        // Standard so the dGPU is enabled. The UI should be
         // hiding these buttons but the controller stays defensive in case
         // the tray menu or a config import triggers them.
         if (target == GpuMode.Optimized || target == GpuMode.Ultimate)
@@ -2584,6 +2584,10 @@ public class GPUModeControl
     private const string NvidiaVulkanIcd = "/usr/share/vulkan/icd.d/nvidia_icd.json";
     private const string NvidiaEglVendor = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json";
 
+    // Observe manifest visibility requests without invoking privileged helpers.
+    // Only consulted with GHELPER_TEST_ROOT set, like RunHelperInTestMode.
+    internal static Action<bool>? ApplyVulkanIcdForTest { get; set; }
+
     /// <summary>
     /// Hide (Eco) / show (Standard) the NVIDIA Vulkan ICD and EGL vendor files
     /// so GL/Vulkan/EGL apps fall back cleanly to the iGPU when the dGPU is
@@ -2594,6 +2598,12 @@ public class GPUModeControl
     /// </summary>
     private static void ApplyVulkanIcd(bool dgpuAvailable)
     {
+        if (IsTestMode)
+        {
+            ApplyVulkanIcdForTest?.Invoke(dgpuAvailable);
+            return;
+        }
+
         // NixOS: ICD/EGL vendor files live under /run/opengl-driver (read-only
         // store), not /usr/share. The FHS paths don't exist and can't be
         // renamed, so this is a no-op there.
@@ -3353,6 +3363,9 @@ public class GPUModeControl
             if (stillBlocked)
                 return GpuSwitchResult.Failed;
 
+            // PCI Eco hides these just like the firmware backend. Returning the
+            // device/driver alone leaves Vulkan and EGL clients on the iGPU.
+            ApplyVulkanIcd(dgpuAvailable: true);
             OnLivePciTransition?.Invoke();
             return GpuSwitchResult.Applied;
         }

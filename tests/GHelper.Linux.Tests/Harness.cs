@@ -23,6 +23,7 @@ public static class Harness
         public FakeAsusWmi Wmi { get; }
         public FakePowerManager Power { get; }
         public GPUModeControl Controller { get; }
+        public List<bool> ManifestVisibilityChanges { get; } = new();
 
         public Sandbox(string scenarioName)
         {
@@ -74,9 +75,13 @@ public static class Harness
             Wmi = new FakeAsusWmi();
             Power = new FakePowerManager();
             Controller = new GPUModeControl(Wmi, Power);
+            GPUModeControl.ApplyVulkanIcdForTest = ManifestVisibilityChanges.Add;
         }
 
-        public void Dispose() { /* Per-scenario state is reset on next ctor */ }
+        public void Dispose()
+        {
+            GPUModeControl.ApplyVulkanIcdForTest = null;
+        }
 
         // Convenience helpers -------------------------------------------------
 

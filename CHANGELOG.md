@@ -6,6 +6,11 @@
 
 ### Fixed
 
+- PCI Eco → Standard restores the NVIDIA Vulkan ICD and EGL vendor manifests,
+  so PRIME/Vulkan games can use the dGPU again without a reboot.
+- PCI backend help no longer claims every mode change requires a reboot
+  (English, Ukrainian and Russian).
+
 ### Changed
 
 ## v1.0.98 (2026-10-31)

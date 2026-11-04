@@ -83,6 +83,9 @@ public static class Scenarios
         Regression_PciStartup_SyncsConfigToActualBlockState();
         Regression_WmiEcoLiveApply_DoesNotLeaveStaleTrigger();
         Regression_PciSwitchBackToStandard_LiveRemovesBlocks();
+        Regression_PciSwitchBackToStandard_RestoresManifestsBeforeCallback();
+        Regression_PciRepeatedRoundTrips_HideAndRestoreManifests();
+        Pci_AlreadyStandard_DoesNotChangeManifests();
         Pci_LiveStandard_HelperFailure_FallsBackToReboot();
         Pci_MuxLatched_ClickEco_EcoBlocked();
         Pci_MuxLiveZero_ClickEco_EcoBlocked();
@@ -390,6 +393,7 @@ public static class Scenarios
                 // Blocks are still removed because WriteDriverBlock(Standard)
                 // in PCI mode also removes them defensively.
                 Assert(!sb.ModprobePresent(), "blocks cleared by WriteDriverBlock");
+                AssertEqual(0, sb.ManifestVisibilityChanges.Count, "failed live transition must not expose manifests");
             }
             finally
             {
@@ -460,6 +464,58 @@ public static class Scenarios
             Assert(!sb.ModprobePresent(), "modprobe block removed");
             Assert(!sb.UdevPresent(), "udev rule removed");
             AssertEqual("standard", AppConfig.GetString("gpu_mode") ?? "", "config saved");
+        });
+
+    static void Regression_PciSwitchBackToStandard_RestoresManifestsBeforeCallback()
+        => Scenario(nameof(Regression_PciSwitchBackToStandard_RestoresManifestsBeforeCallback), sb =>
+        {
+            // Starting in PCI Eco leaves both NVIDIA Vulkan and EGL manifests
+            // hidden. Restoring the PCI device alone is not enough for Proton.
+            AppConfig.Set("gpu_backend", "pci");
+            sb.WriteBlockArtifacts();
+            bool callbackInvoked = false;
+            GPUModeControl.OnLivePciTransition = () =>
+            {
+                callbackInvoked = true;
+                Assert(sb.ManifestVisibilityChanges.SequenceEqual(new[] { true }),
+                    "restore Vulkan/EGL manifests before notifying PCI consumers");
+            };
+            try
+            {
+                var result = sb.Controller.RequestModeSwitch(GpuMode.Standard);
+                AssertEqual(GpuSwitchResult.Applied, result, "live transition applied");
+                Assert(callbackInvoked, "PCI transition callback invoked");
+                Assert(sb.ManifestVisibilityChanges.SequenceEqual(new[] { true }),
+                    "NVIDIA Vulkan/EGL show requested exactly once");
+                Assert(!sb.TriggerPresent(), "no reboot required");
+                Assert(!sb.Wmi.Calls.Any(c => c.Method == "SetGpuEco"), "no ASUS firmware toggle");
+            }
+            finally
+            {
+                GPUModeControl.OnLivePciTransition = null;
+            }
+        });
+
+    static void Regression_PciRepeatedRoundTrips_HideAndRestoreManifests()
+        => Scenario(nameof(Regression_PciRepeatedRoundTrips_HideAndRestoreManifests), sb =>
+        {
+            AppConfig.Set("gpu_backend", "pci");
+            sb.Wmi.MuxMode = 1;
+            for (int cycle = 0; cycle < 2; cycle++)
+            {
+                AssertEqual(GpuSwitchResult.Applied, sb.Controller.RequestModeSwitch(GpuMode.Eco), "live Eco");
+                AssertEqual(GpuSwitchResult.Applied, sb.Controller.RequestModeSwitch(GpuMode.Standard), "live Standard");
+            }
+            Assert(sb.ManifestVisibilityChanges.SequenceEqual(new[] { false, true, false, true }),
+                "every PCI Eco hide must be paired with a Standard restore");
+        });
+
+    static void Pci_AlreadyStandard_DoesNotChangeManifests()
+        => Scenario(nameof(Pci_AlreadyStandard_DoesNotChangeManifests), sb =>
+        {
+            AppConfig.Set("gpu_backend", "pci");
+            AssertEqual(GpuSwitchResult.AlreadySet, sb.Controller.RequestModeSwitch(GpuMode.Standard), "already Standard");
+            AssertEqual(0, sb.ManifestVisibilityChanges.Count, "no manifest changes without a transition");
         });
 
     // 
