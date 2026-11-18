@@ -56,6 +56,7 @@ public static class NvidiaProcessScanner
     private static DateTime _privCacheTime = DateTime.MinValue;
     private static List<NvidiaHolder>? _privCacheResults;
     private static List<string> _filteredSystemCache = new();
+    private static List<NvidiaHolder> _filteredSystemHolders = new();
     private const int PrivilegedCacheSeconds = 5;
 
     /// <summary>
@@ -66,6 +67,17 @@ public static class NvidiaProcessScanner
     {
         lock (_privCacheLock)
             return _filteredSystemCache;
+    }
+
+    /// <summary>
+    /// System processes (never killed) seen by the last scan, with their
+    /// fd counts. Their /dev/nvidia* handles still pin the device, so the
+    /// PCI-unbind safety gate must see them.
+    /// </summary>
+    public static IReadOnlyList<NvidiaHolder> GetFilteredSystemHolders()
+    {
+        lock (_privCacheLock)
+            return _filteredSystemHolders;
     }
 
     private static readonly string[] SystemCommPrefixes = new[]
@@ -157,6 +169,7 @@ public static class NvidiaProcessScanner
     {
         var holders = new Dictionary<int, NvidiaHolder>();
         var sysFiltered = new List<string>();
+        var sysHolders = new List<NvidiaHolder>();
 
         if (!Directory.Exists("/proc"))
             return new List<NvidiaHolder>();
@@ -189,7 +202,10 @@ public static class NvidiaProcessScanner
                 if (IsSystemProcess(comm))
                 {
                     uint sysUid = ReadUid(pid);
-                    sysFiltered.Add(FormatHolderBrief(pid, comm, ResolveUserName(sysUid), nvFds, c.Dri, c.I2c));
+                    string sysUser = ResolveUserName(sysUid);
+                    sysFiltered.Add(FormatHolderBrief(pid, comm, sysUser, nvFds, c.Dri, c.I2c));
+                    sysHolders.Add(new NvidiaHolder(pid, comm, sysUser, nvFds, libsMapped,
+                        sysUid == _currentUid.Value, ResolveServiceUnit(pid), c.Dri, c.I2c));
                     continue;
                 }
                 uint procUid = ReadUid(pid);
@@ -203,7 +219,10 @@ public static class NvidiaProcessScanner
         // Unprivileged path has no separate cache; store filtered list so
         // LogHoldersSnapshot can pick it up via GetFilteredSystemProcesses().
         lock (_privCacheLock)
+        {
             _filteredSystemCache = sysFiltered;
+            _filteredSystemHolders = sysHolders;
+        }
         if (sysFiltered.Count > 0)
             Helpers.Logger.WriteLine($"NvidiaProcessScanner: system holders (won't kill): [{string.Join(", ", sysFiltered)}]");
 
@@ -275,6 +294,7 @@ public static class NvidiaProcessScanner
 
         var holders = new Dictionary<int, NvidiaHolder>();
         var sysFiltered = new List<string>();
+        var sysHolders = new List<NvidiaHolder>();
         int rawCount = 0;
         foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
         {
@@ -301,7 +321,10 @@ public static class NvidiaProcessScanner
             // never killed but logged so they show up in diagnostics.
             if (IsSystemProcess(comm))
             {
-                sysFiltered.Add(FormatHolderBrief(pid, comm, ResolveUserName(procUid), fdCount, driFds, i2cFds));
+                string sysUser = ResolveUserName(procUid);
+                sysFiltered.Add(FormatHolderBrief(pid, comm, sysUser, fdCount, driFds, i2cFds));
+                sysHolders.Add(new NvidiaHolder(pid, comm, sysUser, fdCount, libsMapped,
+                    procUid == _currentUid.Value, serviceUnit, driFds, i2cFds));
                 continue;
             }
 
@@ -319,6 +342,7 @@ public static class NvidiaProcessScanner
         {
             _privCacheResults = result;
             _filteredSystemCache = sysFiltered;
+            _filteredSystemHolders = sysHolders;
             _privCacheTime = DateTime.UtcNow;
         }
         return result;

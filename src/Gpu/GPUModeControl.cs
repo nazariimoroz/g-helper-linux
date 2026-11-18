@@ -2328,11 +2328,17 @@ public class GPUModeControl
         { "nvidia_drm", "nvidia_modeset", "nvidia_uvm", "nvidia_wmi_ec_backlight", "nvidia" };
 
     // Mirror of supergfxctl pci_device.rs:673 (iter.rev() unbind before power change).
-    private record UnbindRecord(string Bdf, string DriverName);
+    internal record UnbindRecord(string Bdf, string DriverName);
 
-    private static bool ReleaseNvidiaModulesAndPurgeHolders(string? dgpuBdf, out List<UnbindRecord> unbindStack)
+    internal static bool ReleaseNvidiaModulesAndPurgeHolders(string? dgpuBdf, out List<UnbindRecord> unbindStack)
     {
         unbindStack = new List<UnbindRecord>();
+
+        if (DgpuUnbindWedged)
+        {
+            Logger.WriteLine("GPUModeControl: a previous dGPU unbind is still stuck in the kernel - refusing further driver release until reboot");
+            return false;
+        }
 
         if (!string.IsNullOrEmpty(dgpuBdf))
         {
@@ -2340,12 +2346,35 @@ public class GPUModeControl
             // we yank the driver.
             TrySignalDrmRemove(dgpuBdf!);
 
+            // The nvidia driver's PCI remove does not fail while /dev/nvidia*
+            // handles are open: it loops in the kernel until they close, and
+            // the writer becomes unkillable. A holder we refuse to kill
+            // (portal, gjs, compositor...) would then wedge the switch and
+            // the next shutdown. Abort before the first unbind instead.
+            if (!WaitForUnbindSafe(UnbindSafeTimeoutMs))
+            {
+                Logger.WriteLine("GPUModeControl: /dev/nvidia* still held - aborting BEFORE PCI unbind (unbinding now would block in the kernel until reboot)");
+                return false;
+            }
+
             var funcs = EnumerateDgpuFunctions(dgpuBdf!);
             funcs.Reverse(); // highest function first (.1 audio before .0 graphics)
             foreach (var rec in funcs)
             {
                 Logger.WriteLine($"GPUModeControl: unbinding {rec.Bdf} from {rec.DriverName}");
-                if (!TryUnbindFunction(rec))
+                var outcome = TryUnbindFunction(rec);
+                if (outcome == UnbindOutcome.Wedged)
+                {
+                    // The device lock is held by the stuck remove: a rebind of
+                    // THIS function would block forever as well. Other
+                    // functions have their own locks and can be restored.
+                    DgpuUnbindWedged = true;
+                    Logger.WriteLine($"GPUModeControl: unbind {rec.Bdf} is stuck in the kernel - NOT rebinding it; reboot required (shutdown may hang and need a forced power-off)");
+                    RollbackUnbinds(unbindStack);
+                    unbindStack = new List<UnbindRecord>();
+                    return false;
+                }
+                if (outcome != UnbindOutcome.Done)
                 {
                     Logger.WriteLine($"GPUModeControl: unbind {rec.Bdf} FAILED - rolling back");
                     RollbackUnbinds(unbindStack);
@@ -2481,34 +2510,180 @@ public class GPUModeControl
         return results;
     }
 
-    private static bool TryUnbindFunction(UnbindRecord rec)
-    {
-        if (RunPciAction("pci-unbind", rec.DriverName, rec.Bdf, sudoTimeoutMs: 30000))
-            return true;
+    internal enum UnbindOutcome { Done, Failed, Wedged }
 
-        // The unbind write blocks in the kernel while GPU contexts of freshly
-        // killed processes are torn down; our sudo timeout abandons the helper
-        // but the write keeps running and usually completes moments later.
-        // Declaring failure here while the kernel finishes the unbind leaves
-        // the device driverless with no rollback record - poll for the late
-        // completion before giving up.
-        Logger.WriteLine($"GPUModeControl: unbind {rec.Bdf} timed out - polling for late completion");
-        string driverLink = TestPathPrefix + $"/sys/bus/pci/devices/{rec.Bdf}/driver";
-        int waited = 0;
-        const int stepMs = 500;
-        const int maxMs = 30000;
-        while (waited < maxMs)
+    /// <summary>
+    /// Set once a pci-unbind write is known to be stuck inside the driver's
+    /// remove callback. Further unbind/rebind attempts on the dGPU would only
+    /// queue behind the same device lock, so driver release is refused until
+    /// reboot.
+    /// </summary>
+    internal static bool DgpuUnbindWedged { get; set; }
+
+    private const int UnbindSafeTimeoutMs = 5000;
+
+    // Test hooks (consulted only with GHELPER_TEST_ROOT set).
+    internal static Func<IReadOnlyList<NvidiaHolder>>? UnbindHolderScanForTest { get; set; }
+    internal static Func<string, string, string, bool>? PciActionForTest { get; set; }
+    internal static Func<string, string, bool>? PciActionInFlightForTest { get; set; }
+
+    /// <summary>
+    /// Holders whose handles the nvidia PCI remove waits on: /dev/nvidia*
+    /// fds or mappings (reported as FdCount) and nvidia I2C adapter fds
+    /// (i2c_del_adapter waits for them). DRM fds alone are fine - nvidia-drm
+    /// unplugs its device without waiting for userspace.
+    /// </summary>
+    internal static List<NvidiaHolder> SelectUnbindBlockers(IEnumerable<NvidiaHolder> holders)
+    {
+        var result = new List<NvidiaHolder>();
+        var seen = new HashSet<int>();
+        foreach (var h in holders)
+            if ((h.FdCount > 0 || h.I2cFdCount > 0) && seen.Add(h.Pid))
+                result.Add(h);
+        return result;
+    }
+
+    private static List<NvidiaHolder> ScanUnbindBlockers()
+    {
+        if (IsTestMode)
+            return SelectUnbindBlockers(UnbindHolderScanForTest?.Invoke() ?? Array.Empty<NvidiaHolder>());
+
+        NvidiaProcessScanner.InvalidateScanCache();
+        var all = new List<NvidiaHolder>(NvidiaProcessScanner.ScanHolders());
+        all.AddRange(NvidiaProcessScanner.GetFilteredSystemHolders());
+        return SelectUnbindBlockers(all);
+    }
+
+    /// <summary>
+    /// Kill the holders G-Helper is allowed to kill, then wait up to
+    /// <paramref name="timeoutMs"/> for every /dev/nvidia* handle - including
+    /// those of protected system processes - to close. Returns false when
+    /// anything still holds the device; the caller must not unbind then.
+    /// </summary>
+    internal static bool WaitForUnbindSafe(int timeoutMs, int stepMs = 500)
+    {
+        if (!IsTestMode)
         {
-            Thread.Sleep(stepMs);
-            waited += stepMs;
-            if (!Directory.Exists(driverLink))
+            NvidiaProcessScanner.InvalidateScanCache();
+            NvidiaProcessScanner.KillAllHolders(force: true, out int killed, out int failed);
+            if (killed + failed > 0)
+                Logger.WriteLine($"GPUModeControl: pre-unbind purge killed={killed} failed={failed}");
+        }
+
+        int waited = 0;
+        while (true)
+        {
+            var blockers = ScanUnbindBlockers();
+            if (blockers.Count == 0)
             {
-                Logger.WriteLine($"GPUModeControl: unbind {rec.Bdf} completed late after extra {waited}ms");
+                if (waited > 0)
+                    Logger.WriteLine($"GPUModeControl: /dev/nvidia* released after {waited}ms - safe to unbind");
                 return true;
             }
+            if (waited >= timeoutMs)
+            {
+                var parts = new List<string>(blockers.Count);
+                foreach (var h in blockers)
+                    parts.Add($"{h.Pid}:{h.Comm}({h.User})/{h.FdCount}fds" + (h.I2cFdCount > 0 ? $"+{h.I2cFdCount}i2c" : ""));
+                Logger.WriteLine($"GPUModeControl: unbind blockers after {waited}ms: [{string.Join(", ", parts)}]");
+                return false;
+            }
+            Thread.Sleep(stepMs);
+            waited += stepMs;
         }
-        Logger.WriteLine($"GPUModeControl: unbind {rec.Bdf} never completed ({maxMs}ms extra wait)");
+    }
+
+    /// <summary>
+    /// True while a gpu-helper (or its sudo/pkexec wrapper) running
+    /// "&lt;action&gt; ... &lt;bdf&gt;" is still alive. The sudo timeout only kills
+    /// the wrapper; a helper blocked in a sysfs write survives (reparented to
+    /// init) until the kernel returns.
+    /// </summary>
+    private static bool IsPciActionInFlight(string action, string bdf)
+    {
+        if (IsTestMode)
+            return PciActionInFlightForTest?.Invoke(action, bdf) ?? false;
+
+        IEnumerable<string> procDirs;
+        try
+        { procDirs = Directory.EnumerateDirectories("/proc"); }
+        catch { return false; }
+
+        int self = Environment.ProcessId;
+        foreach (var dir in procDirs)
+        {
+            if (!int.TryParse(Path.GetFileName(dir), out int pid) || pid == self)
+                continue;
+            string[] argv;
+            try
+            {
+                string raw = File.ReadAllText(Path.Combine(dir, "cmdline"));
+                if (raw.Length == 0)
+                    continue;
+                argv = raw.TrimEnd('\0').Split('\0');
+            }
+            catch { continue; }
+
+            bool helper = false, hasAction = false, hasBdf = false;
+            foreach (var a in argv)
+            {
+                if (a.EndsWith("gpu-helper", StringComparison.Ordinal))
+                    helper = true;
+                else if (a == action)
+                    hasAction = true;
+                else if (a == bdf)
+                    hasBdf = true;
+            }
+            if (helper && hasAction && hasBdf)
+                return true;
+        }
         return false;
+    }
+
+    // Extra wait for a pci-unbind whose helper did not return in time.
+    internal static int UnbindLateMaxMs { get; set; } = 30000;
+    internal static int UnbindLateStepMs { get; set; } = 500;
+
+    internal static UnbindOutcome TryUnbindFunction(UnbindRecord rec)
+        => TryUnbindFunction(rec, UnbindLateMaxMs, UnbindLateStepMs);
+
+    internal static UnbindOutcome TryUnbindFunction(UnbindRecord rec, int lateMaxMs, int stepMs)
+    {
+        if (RunPciAction("pci-unbind", rec.DriverName, rec.Bdf, sudoTimeoutMs: 30000))
+            return UnbindOutcome.Done;
+
+        // The unbind write can block in the kernel while GPU contexts of
+        // freshly killed processes are torn down; our sudo timeout abandons
+        // the helper but the write keeps running and may complete later.
+        // The driver symlink is NOT proof of completion: the kernel removes
+        // it before calling the driver's remove(), which is exactly where
+        // nvidia waits for open handles. Done means the helper has exited
+        // AND the driver is gone.
+        Logger.WriteLine($"GPUModeControl: unbind {rec.Bdf} did not return - waiting for the kernel write to finish");
+        string driverLink = TestPathPrefix + $"/sys/bus/pci/devices/{rec.Bdf}/driver";
+        int waited = 0;
+        while (true)
+        {
+            bool inFlight = IsPciActionInFlight("pci-unbind", rec.Bdf);
+            bool driverGone = !Directory.Exists(driverLink);
+            if (!inFlight)
+            {
+                if (driverGone)
+                {
+                    Logger.WriteLine($"GPUModeControl: unbind {rec.Bdf} completed late after extra {waited}ms (helper exited)");
+                    return UnbindOutcome.Done;
+                }
+                Logger.WriteLine($"GPUModeControl: unbind {rec.Bdf} failed - helper exited, driver still bound");
+                return UnbindOutcome.Failed;
+            }
+            if (waited >= lateMaxMs)
+            {
+                Logger.WriteLine($"GPUModeControl: unbind {rec.Bdf} still blocked in the kernel after extra {waited}ms (driver link {(driverGone ? "removed" : "present")}) - WEDGED");
+                return UnbindOutcome.Wedged;
+            }
+            Thread.Sleep(stepMs);
+            waited += stepMs;
+        }
     }
 
     private static bool TryRebindFunction(UnbindRecord rec)
@@ -2535,6 +2710,8 @@ public class GPUModeControl
 
     private static bool RunPciAction(string action, string driver, string bdf, int sudoTimeoutMs = 10000)
     {
+        if (IsTestMode && PciActionForTest != null)
+            return PciActionForTest(action, driver, bdf);
         var r = SysfsHelper.RunSudoOrPkexec(
             SysfsHelper.GpuHelperPath, new[] { action, driver, bdf },
             sudoTimeoutMs: sudoTimeoutMs, pkexecTimeoutMs: 60000);

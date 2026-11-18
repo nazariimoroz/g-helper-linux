@@ -10,6 +10,13 @@
   so PRIME/Vulkan games can use the dGPU again without a reboot.
 - PCI backend help no longer claims every mode change requires a reboot
   (English, Ukrainian and Russian).
+- PCI Eco "Switch Now" no longer unbinds the NVIDIA driver while a protected
+  process (portal, gjs, compositor) still holds `/dev/nvidia*`. The kernel
+  remove waited forever, left `gpu-helper` unkillable and hung the next
+  shutdown. The switch now stops before the unbind and moves Eco to reboot.
+- A timed-out PCI unbind is no longer reported as "completed late" just
+  because the driver link disappeared. G-Helper now waits for the helper to
+  exit. If it stays stuck, G-Helper skips the rebind that would also hang.
 
 ### Changed
 

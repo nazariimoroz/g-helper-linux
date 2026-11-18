@@ -76,11 +76,23 @@ public static class Harness
             Power = new FakePowerManager();
             Controller = new GPUModeControl(Wmi, Power);
             GPUModeControl.ApplyVulkanIcdForTest = ManifestVisibilityChanges.Add;
+            ResetUnbindHooks();
         }
 
         public void Dispose()
         {
             GPUModeControl.ApplyVulkanIcdForTest = null;
+            ResetUnbindHooks();
+        }
+
+        private static void ResetUnbindHooks()
+        {
+            GPUModeControl.DgpuUnbindWedged = false;
+            GPUModeControl.UnbindHolderScanForTest = null;
+            GPUModeControl.PciActionForTest = null;
+            GPUModeControl.PciActionInFlightForTest = null;
+            GPUModeControl.UnbindLateMaxMs = 30000;
+            GPUModeControl.UnbindLateStepMs = 500;
         }
 
         // Convenience helpers -------------------------------------------------
